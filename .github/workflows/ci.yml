@@ -1,0 +1,53 @@
+name: Continuous Integration
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test (Java 17)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 17 and Maven cache
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Show Java and Maven versions
+        run: |
+          java -version
+          bash ./mvnw --version
+
+      - name: Build and test all modules
+        run: bash ./mvnw --batch-mode --no-transfer-progress clean verify
+
+      - name: Start and initialize DynamoDB Local
+        shell: pwsh
+        run: ./scripts/initialize-dynamodb-local.ps1
+
+      - name: Run DynamoDB integration tests
+        run: >-
+          bash ./mvnw --batch-mode --no-transfer-progress
+          -pl feedflow-api -Pdynamodb-local verify

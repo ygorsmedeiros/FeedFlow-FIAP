@@ -1,0 +1,78 @@
+name: Deploy direto (AWS)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-feedflow-dev
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  STACK_NAME: feedflow-dev
+
+jobs:
+  test:
+    name: Build e testes (Java 17)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - run: bash ./mvnw --batch-mode --no-transfer-progress clean verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: function-packages
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            feedflow-api/target/function.zip
+            feedflow-notifications/target/function.zip
+            feedflow-reports/target/function.zip
+
+  deploy:
+    name: Lambdas e monitoramento
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    environment: feedflow-dev
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/download-artifact@v4
+        with:
+          name: function-packages
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy direto
+        env:
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+        run: ./scripts/deploy-direct.sh
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          url=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue | [0]" --output text)
+          curl --fail --silent --show-error "${url%/}/health" | jq -e '.status == "UP"'
+          code=$(curl --silent --show-error -o /dev/null -w '%{http_code}' -X POST "${url%/}/avaliacao" \
+            -H 'Content-Type: application/json' -d '{"descricao":"Teste de nota inválida","nota":11}')
+          test "$code" = 400

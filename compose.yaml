@@ -1,0 +1,30 @@
+name: feedflow
+
+services:
+  dynamodb-local:
+    image: amazon/dynamodb-local:3.3.2
+    user: root
+    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath /home/dynamodblocal/data"
+    working_dir: /home/dynamodblocal
+    ports:
+      - "8000:8000"
+    volumes:
+      - feedflow-dynamodb-data:/home/dynamodblocal/data
+
+  dynamodb-admin:
+    image: amazon/aws-cli:2.36.44
+    profiles:
+      - tools
+    depends_on:
+      - dynamodb-local
+    environment:
+      AWS_ACCESS_KEY_ID: DUMMYIDEXAMPLE
+      AWS_SECRET_ACCESS_KEY: DUMMYEXAMPLEKEY
+      AWS_DEFAULT_REGION: us-east-2
+    entrypoint:
+      - aws
+    volumes:
+      - ./docker/dynamodb:/work:ro
+
+volumes:
+  feedflow-dynamodb-data:

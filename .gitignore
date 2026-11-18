@@ -1,0 +1,40 @@
+﻿# Maven e Quarkus
+target/
+.quarkus/
+.aws-sam/
+.maven-repository/
+.maven-user-home/
+dependency-reduced-pom.xml
+.flattened-pom.xml
+
+# IDEs e editores
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# Configuração local e credenciais
+.env
+.env.*
+!.env.example
+.aws/
+application-local.properties
+application-*.local.properties
+*.pem
+*.key
+*.p12
+*.jks
+
+# Logs, temporários e relatórios de falha da JVM
+*.log
+logs/
+tmp/
+temp/
+hs_err_pid*
+replay_pid*
+
+# Sistema operacional
+.DS_Store
+Thumbs.db

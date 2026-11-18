@@ -1,0 +1,717 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Bootstrap de seguranca para futuros deployments do FeedFlow via GitHub Actions OIDC.
+  Este template e separado da stack da aplicacao para evitar dependencia circular.
+
+Parameters:
+  CreateGitHubOidcProvider:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Use true somente se a conta ainda nao possuir o provider
+      token.actions.githubusercontent.com.
+
+  GitHubOidcSubject:
+    Type: String
+    AllowedPattern: '^repo:ygorsmedeiros(@[0-9]+)?/FeedFlow(@[0-9]+)?:environment:feedflow-dev$'
+    ConstraintDescription: >-
+      Informe o subject exato do repositorio ygorsmedeiros/FeedFlow e do environment
+      feedflow-dev, com IDs imutaveis quando habilitados no GitHub.
+    Description: >-
+      Claim sub exato emitido pelo GitHub. Confirme se o repositorio usa o formato
+      nominal ou o formato com owner_id e repository_id antes do provisionamento.
+
+  SamArtifactBucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Informe um nome de bucket S3 valido.
+    Description: Bucket S3 existente e exclusivo para artefatos de deployment do SAM.
+
+  ApplicationStackName:
+    Type: String
+    Default: feedflow-dev
+    AllowedValues:
+      - feedflow-dev
+    Description: Stack da aplicacao que a pipeline podera atualizar.
+
+  FeedbackTableName:
+    Type: String
+    Default: FeedFlowFeedback
+    AllowedValues:
+      - FeedFlowFeedback
+    Description: Tabela DynamoDB gerenciada pela stack FeedFlow.
+
+  FeedFlowHttpApiId:
+    Type: String
+    AllowedPattern: '^[a-z0-9]{10}$'
+    ConstraintDescription: Informe o ID fisico de 10 caracteres da HTTP API FeedFlow existente.
+    Description: >-
+      ID fisico da AWS::Serverless::HttpApi pertencente a stack feedflow-dev.
+      Deve ser obtido por consulta somente de leitura antes do bootstrap.
+
+Conditions:
+  ShouldCreateGitHubOidcProvider: !Equals
+    - !Ref CreateGitHubOidcProvider
+    - 'true'
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateGitHubOidcProvider
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Purpose
+          Value: GitHubActionsOidc
+
+  FeedFlowApiRuntimeBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ManagedPolicyName: !Sub '${ApplicationStackName}-api-runtime-boundary'
+      Description: Limite maximo de permissoes da role de runtime da API FeedFlow.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ApiFeedbackTableAccess
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+            Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${FeedbackTableName}'
+          - Sid: ApiFeedbackWeekIndexAccess
+            Effect: Allow
+            Action:
+              - dynamodb:Query
+            Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${FeedbackTableName}/index/byWeek'
+          - Sid: ApiLogDelivery
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}-api:log-stream:*'
+
+  FeedFlowNotificationsRuntimeBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ManagedPolicyName: !Sub '${ApplicationStackName}-notifications-runtime-boundary'
+      Description: Limite maximo de permissoes da role de notificacoes FeedFlow.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: NotificationStreamRead
+            Effect: Allow
+            Action:
+              - dynamodb:DescribeStream
+              - dynamodb:GetRecords
+              - dynamodb:GetShardIterator
+            Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${FeedbackTableName}/stream/*'
+          - Sid: NotificationStreamList
+            Effect: Allow
+            Action:
+              - dynamodb:ListStreams
+            Resource: '*'
+          - Sid: NotificationPublishCriticalAlert
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-critical-alerts'
+          - Sid: NotificationFailureDestination
+            Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-notifications-failures'
+          - Sid: NotificationLogDelivery
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}-notifications:log-stream:*'
+
+  FeedFlowReportsRuntimeBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ManagedPolicyName: !Sub '${ApplicationStackName}-reports-runtime-boundary'
+      Description: Limite maximo de permissoes da role de relatorios FeedFlow.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReportsFeedbackWeekIndexAccess
+            Effect: Allow
+            Action:
+              - dynamodb:Query
+            Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${FeedbackTableName}/index/byWeek'
+          - Sid: ReportsPublishWeeklyReport
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-weekly-reports'
+          - Sid: ReportsFailureDestination
+            Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-reports-failures'
+          - Sid: ReportsLogDelivery
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}-reports:log-stream:*'
+
+  FeedFlowReportsSchedulerBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ManagedPolicyName: !Sub '${ApplicationStackName}-reports-scheduler-boundary'
+      Description: Limite maximo de permissoes da role do Scheduler FeedFlow.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SchedulerInvokeReportsFunction
+            Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ApplicationStackName}-reports'
+          - Sid: SchedulerFailureDestination
+            Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-reports-failures'
+
+  FeedFlowCloudFormationComputePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ApplicationStackName}-cfn-compute'
+      Description: Gerencia compute, API, logs e Scheduler definidos pelo FeedFlow.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManageFeedFlowLambdaFunctions
+            Effect: Allow
+            Action:
+              - lambda:AddPermission
+              - lambda:CreateFunction
+              - lambda:DeleteFunction
+              - lambda:DeleteFunctionEventInvokeConfig
+              - lambda:GetFunction
+              - lambda:GetFunctionConfiguration
+              - lambda:GetFunctionEventInvokeConfig
+              - lambda:GetPolicy
+              - lambda:ListFunctionEventInvokeConfigs
+              - lambda:ListTags
+              - lambda:PutFunctionEventInvokeConfig
+              - lambda:RemovePermission
+              - lambda:TagResource
+              - lambda:UntagResource
+              - lambda:UpdateFunctionEventInvokeConfig
+              - lambda:UpdateFunctionCode
+              - lambda:UpdateFunctionConfiguration
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ApplicationStackName}-api'
+              - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ApplicationStackName}-notifications'
+              - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ApplicationStackName}-reports'
+
+          - Sid: CreateNotificationsEventSourceMapping
+            Effect: Allow
+            Action:
+              - lambda:CreateEventSourceMapping
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                lambda:FunctionArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ApplicationStackName}-notifications'
+
+          - Sid: ManageNotificationsEventSourceMapping
+            Effect: Allow
+            Action:
+              - lambda:DeleteEventSourceMapping
+              - lambda:GetEventSourceMapping
+              - lambda:UpdateEventSourceMapping
+            Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*'
+            Condition:
+              ArnEquals:
+                lambda:FunctionArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ApplicationStackName}-notifications'
+
+          - Sid: ReadEventSourceMappingTags
+            Effect: Allow
+            Action:
+              - lambda:ListTags
+            Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*'
+
+          - Sid: TagFeedFlowEventSourceMapping
+            Effect: Allow
+            Action:
+              - lambda:TagResource
+            Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*'
+            Condition:
+              StringEquals:
+                aws:RequestTag/Application: FeedFlow
+
+          - Sid: UntagFeedFlowEventSourceMapping
+            Effect: Allow
+            Action:
+              - lambda:UntagResource
+            Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*'
+            Condition:
+              StringEquals:
+                aws:ResourceTag/Application: FeedFlow
+
+          - Sid: ListLambdaEventSourceMappings
+            Effect: Allow
+            Action:
+              - lambda:ListEventSourceMappings
+            Resource: '*'
+
+          - Sid: ManageExistingFeedFlowHttpApi
+            Effect: Allow
+            Action:
+              - apigateway:DELETE
+              - apigateway:GET
+              - apigateway:PATCH
+              - apigateway:POST
+              - apigateway:PUT
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${FeedFlowHttpApiId}'
+              - !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${FeedFlowHttpApiId}/*'
+
+          - Sid: ManageFeedFlowLogGroups
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:DeleteLogGroup
+              - logs:DeleteRetentionPolicy
+              - logs:ListTagsForResource
+              - logs:PutRetentionPolicy
+              - logs:TagResource
+              - logs:UntagResource
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}-api'
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}-api:*'
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}-notifications'
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}-notifications:*'
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}-reports'
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}-reports:*'
+
+          - Sid: ReadFeedFlowLogGroupConfiguration
+            Effect: Allow
+            Action:
+              - logs:DescribeIndexPolicies
+              - logs:GetDataProtectionPolicy
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}-api'
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}-notifications'
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}-reports'
+
+          - Sid: DescribeLogGroups
+            Effect: Allow
+            Action:
+              - logs:DescribeLogGroups
+              - logs:DescribeResourcePolicies
+            Resource: '*'
+
+          - Sid: ManageFeedFlowSchedule
+            Effect: Allow
+            Action:
+              - scheduler:CreateSchedule
+              - scheduler:DeleteSchedule
+              - scheduler:GetSchedule
+              - scheduler:TagResource
+              - scheduler:UntagResource
+              - scheduler:UpdateSchedule
+            Resource: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/${ApplicationStackName}-weekly-report'
+
+          - Sid: ReadPackagedLambdaArtifacts
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${SamArtifactBucketName}/${ApplicationStackName}/*'
+            Condition:
+              StringEquals:
+                s3:ResourceAccount: !Ref AWS::AccountId
+
+  FeedFlowCloudFormationDataPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ApplicationStackName}-cfn-data'
+      Description: Gerencia os recursos de dados e mensageria definidos pelo FeedFlow.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManageFeedFlowFeedbackTable
+            Effect: Allow
+            Action:
+              - dynamodb:CreateTable
+              - dynamodb:DescribeContinuousBackups
+              - dynamodb:DescribeContributorInsights
+              - dynamodb:DescribeKinesisStreamingDestination
+              - dynamodb:DescribeTable
+              - dynamodb:DescribeTimeToLive
+              - dynamodb:GetResourcePolicy
+              - dynamodb:ListTagsOfResource
+              - dynamodb:TagResource
+              - dynamodb:UntagResource
+              - dynamodb:UpdateContinuousBackups
+              - dynamodb:UpdateTable
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${FeedbackTableName}'
+              - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${FeedbackTableName}/index/byWeek'
+
+          - Sid: PreventFeedbackTableDeletion
+            Effect: Deny
+            Action:
+              - dynamodb:DeleteTable
+            Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${FeedbackTableName}'
+
+          - Sid: ManageFeedFlowTopics
+            Effect: Allow
+            Action:
+              - sns:CreateTopic
+              - sns:DeleteTopic
+              - sns:GetTopicAttributes
+              - sns:GetDataProtectionPolicy
+              - sns:ListSubscriptionsByTopic
+              - sns:ListTagsForResource
+              - sns:SetTopicAttributes
+              - sns:TagResource
+              - sns:UntagResource
+              - sns:Subscribe
+              - sns:Unsubscribe
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-critical-alerts'
+              - !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-weekly-reports'
+              - !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-ops-alarms'
+
+          - Sid: ManageFeedFlowMonitoring
+            Effect: Allow
+            Action:
+              - cloudwatch:PutMetricAlarm
+              - cloudwatch:DeleteAlarms
+              - cloudwatch:DescribeAlarms
+              - cloudwatch:ListTagsForResource
+              - cloudwatch:TagResource
+              - cloudwatch:UntagResource
+            Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ApplicationStackName}-*'
+
+          - Sid: ManageFeedFlowDashboard
+            Effect: Allow
+            Action:
+              - cloudwatch:PutDashboard
+              - cloudwatch:DeleteDashboards
+              - cloudwatch:GetDashboard
+            Resource: !Sub 'arn:${AWS::Partition}:cloudwatch::${AWS::AccountId}:dashboard/${ApplicationStackName}-overview'
+
+          - Sid: ManageFeedFlowQueues
+            Effect: Allow
+            Action:
+              - sqs:CreateQueue
+              - sqs:DeleteQueue
+              - sqs:GetQueueAttributes
+              - sqs:GetQueueUrl
+              - sqs:ListQueueTags
+              - sqs:SetQueueAttributes
+              - sqs:TagQueue
+              - sqs:UntagQueue
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-notifications-failures'
+              - !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-reports-failures'
+
+  FeedFlowCloudFormationIamPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ApplicationStackName}-cfn-iam'
+      Description: Gerencia somente as roles IAM pertencentes a stack FeedFlow.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CreateApiRuntimeRoleWithBoundary
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-api-runtime'
+            Condition:
+              ArnEquals:
+                iam:PermissionsBoundary: !Ref FeedFlowApiRuntimeBoundary
+
+          - Sid: CreateNotificationsRuntimeRoleWithBoundary
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-notifications-runtime'
+            Condition:
+              ArnEquals:
+                iam:PermissionsBoundary: !Ref FeedFlowNotificationsRuntimeBoundary
+
+          - Sid: CreateReportsRuntimeRoleWithBoundary
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-reports-runtime'
+            Condition:
+              ArnEquals:
+                iam:PermissionsBoundary: !Ref FeedFlowReportsRuntimeBoundary
+
+          - Sid: CreateReportsSchedulerRoleWithBoundary
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-reports-scheduler'
+            Condition:
+              ArnEquals:
+                iam:PermissionsBoundary: !Ref FeedFlowReportsSchedulerBoundary
+
+          - Sid: ManageOnlyApprovedRuntimeRoles
+            Effect: Allow
+            Action:
+              - iam:DeleteRole
+              - iam:DeleteRolePolicy
+              - iam:GetRole
+              - iam:GetRolePolicy
+              - iam:ListAttachedRolePolicies
+              - iam:ListRolePolicies
+              - iam:ListRoleTags
+              - iam:PutRolePolicy
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:UpdateAssumeRolePolicy
+              - iam:UpdateRoleDescription
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-api-runtime'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-notifications-runtime'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-reports-runtime'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-reports-scheduler'
+
+          - Sid: PassLambdaRuntimeRolesOnlyToLambda
+            Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-api-runtime'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-notifications-runtime'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-reports-runtime'
+            Condition:
+              StringEquals:
+                iam:PassedToService: lambda.amazonaws.com
+
+          - Sid: PassSchedulerRoleOnlyToScheduler
+            Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-reports-scheduler'
+            Condition:
+              StringEquals:
+                iam:PassedToService: scheduler.amazonaws.com
+
+          - Sid: PreventRuntimeBoundaryRemovalOrReplacement
+            Effect: Deny
+            Action:
+              - iam:DeleteRolePermissionsBoundary
+              - iam:PutRolePermissionsBoundary
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-api-runtime'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-notifications-runtime'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-reports-runtime'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-reports-scheduler'
+
+          - Sid: PreventRuntimeBoundaryPolicyMutation
+            Effect: Deny
+            Action:
+              - iam:CreatePolicyVersion
+              - iam:DeletePolicy
+              - iam:DeletePolicyVersion
+              - iam:SetDefaultPolicyVersion
+            Resource:
+              - !Ref FeedFlowApiRuntimeBoundary
+              - !Ref FeedFlowNotificationsRuntimeBoundary
+              - !Ref FeedFlowReportsRuntimeBoundary
+              - !Ref FeedFlowReportsSchedulerBoundary
+
+  FeedFlowCloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: feedflow-cloudformation-execution
+      Description: Execution role usada exclusivamente pelo CloudFormation na stack FeedFlow.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFormationAssumeRole
+            Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref FeedFlowCloudFormationComputePolicy
+        - !Ref FeedFlowCloudFormationDataPolicy
+        - !Ref FeedFlowCloudFormationIamPolicy
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Purpose
+          Value: CloudFormationExecution
+
+  FeedFlowGitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: feedflow-github-actions-deploy
+      Description: Role OIDC de orquestracao do deployment FeedFlow pelo GitHub Actions.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: GitHubActionsOidcAssumeRole
+            Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateGitHubOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action:
+              - sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Ref GitHubOidcSubject
+      Policies:
+        - PolicyName: FeedFlowArtifactUpload
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadArtifactBucketMetadata
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${SamArtifactBucketName}'
+                Condition:
+                  StringEquals:
+                    s3:ResourceAccount: !Ref AWS::AccountId
+
+              - Sid: ListFeedFlowArtifactPrefix
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${SamArtifactBucketName}'
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - !Ref ApplicationStackName
+                      - !Sub '${ApplicationStackName}/*'
+                  StringEquals:
+                    s3:ResourceAccount: !Ref AWS::AccountId
+
+              - Sid: PublishFeedFlowArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${SamArtifactBucketName}/${ApplicationStackName}/*'
+                Condition:
+                  StringEquals:
+                    s3:ResourceAccount: !Ref AWS::AccountId
+
+        - PolicyName: FeedFlowChangeSetOrchestration
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CreateFeedFlowChangeSetWithExecutionRole
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31'
+                Condition:
+                  ArnEquals:
+                    cloudformation:RoleArn: !GetAtt FeedFlowCloudFormationExecutionRole.Arn
+
+              - Sid: ManageFeedFlowChangeSets
+                Effect: Allow
+                Action:
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*'
+
+              - Sid: ReadFeedFlowStack
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:DescribeStacks
+                  - cloudformation:GetTemplate
+                  - cloudformation:ListChangeSets
+                  - cloudformation:ListStackResources
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*'
+
+              - Sid: ValidateCloudFormationTemplates
+                Effect: Allow
+                Action:
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ValidateTemplate
+                Resource: '*'
+
+              - Sid: PassCloudFormationExecutionRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt FeedFlowCloudFormationExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Purpose
+          Value: GitHubActionsDeployment
+
+Outputs:
+  GitHubActionsDeployRoleArn:
+    Description: ARN a ser usada futuramente por aws-actions/configure-aws-credentials.
+    Value: !GetAtt FeedFlowGitHubActionsDeployRole.Arn
+
+  CloudFormationExecutionRoleArn:
+    Description: ARN a ser informada ao sam deploy por meio de --role-arn.
+    Value: !GetAtt FeedFlowCloudFormationExecutionRole.Arn
+
+  GitHubOidcProviderArn:
+    Description: ARN deterministica do provider OIDC GitHub na conta.
+    Value: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+
+  SamArtifactLocation:
+    Description: Bucket e prefixo exclusivos que o futuro CD devera usar.
+    Value: !Sub 's3://${SamArtifactBucketName}/${ApplicationStackName}/'
+
+  AuthorizedFeedFlowHttpApiId:
+    Description: ID fisico da HTTP API autorizado para alteracao pela execution role.
+    Value: !Ref FeedFlowHttpApiId
+
+  ApiRuntimeBoundaryArn:
+    Description: Permissions boundary obrigatoria da role de runtime da API.
+    Value: !Ref FeedFlowApiRuntimeBoundary
+
+  NotificationsRuntimeBoundaryArn:
+    Description: Permissions boundary obrigatoria da role de notificacoes.
+    Value: !Ref FeedFlowNotificationsRuntimeBoundary
+
+  ReportsRuntimeBoundaryArn:
+    Description: Permissions boundary obrigatoria da role de relatorios.
+    Value: !Ref FeedFlowReportsRuntimeBoundary
+
+  ReportsSchedulerBoundaryArn:
+    Description: Permissions boundary obrigatoria da role do Scheduler.
+    Value: !Ref FeedFlowReportsSchedulerBoundary

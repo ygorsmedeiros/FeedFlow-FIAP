@@ -1,0 +1,844 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: FeedFlow - API, alertas criticos, relatorio semanal e monitoramento
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedPattern: '^[a-z][a-z0-9-]{1,14}$'
+    Description: Identificador curto do ambiente.
+
+  FeedbackTableName:
+    Type: String
+    Default: FeedFlowFeedback
+    AllowedPattern: '^[A-Za-z0-9_.-]{3,255}$'
+    Description: Nome da tabela de avaliacoes.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+    Description: Retencao dos logs da Lambda no CloudWatch Logs.
+
+  RuntimeRoleHardeningEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Habilita nomes deterministas e permissions boundaries nas quatro roles de runtime.
+      Exige que o bootstrap OIDC tenha sido provisionado e substitui as roles existentes.
+
+  DynamoDbSafetyControlsEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Habilita deletion protection e point-in-time recovery na tabela existente.
+      O padrao false preserva o estado atual ate aprovacao explicita.
+
+  AdminEmail:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: >-
+      E-mail do administrador que recebe alertas criticos, relatorios semanais e alarmes
+      operacionais. Vazio = nenhuma assinatura criada. A AWS envia um e-mail de confirmacao.
+
+Conditions:
+  HasAdminEmail: !Not [!Equals [!Ref AdminEmail, '']]
+  UseRuntimeRoleHardening: !Equals [!Ref RuntimeRoleHardeningEnabled, 'true']
+  EnableDynamoDbSafetyControls: !Equals [!Ref DynamoDbSafetyControlsEnabled, 'true']
+
+Resources:
+  FeedFlowHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: !Sub '${AWS::StackName}-http-api'
+      StageName: '$default'
+      FailOnWarnings: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  FeedFlowFeedbackTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Ref FeedbackTableName
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !If [EnableDynamoDbSafetyControls, true, false]
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnableDynamoDbSafetyControls, true, false]
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: weekKey
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: byWeek
+          KeySchema:
+            - AttributeName: weekKey
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-api'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowNotificationsLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-notifications'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowReportsLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-reports'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowCriticalAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-critical-alerts'
+      DisplayName: FeedFlow Critical Alerts
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowWeeklyReportsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-weekly-reports'
+      DisplayName: FeedFlow Weekly Reports
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowOpsAlarmsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-ops-alarms'
+      DisplayName: FeedFlow Operational Alarms
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowCriticalAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAdminEmail
+    Properties:
+      TopicArn: !Ref FeedFlowCriticalAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+
+  FeedFlowWeeklyReportsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAdminEmail
+    Properties:
+      TopicArn: !Ref FeedFlowWeeklyReportsTopic
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+
+  FeedFlowOpsAlarmsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAdminEmail
+    Properties:
+      TopicArn: !Ref FeedFlowOpsAlarmsTopic
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+
+  FeedFlowNotificationsFailureQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-notifications-failures'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowReportsFailureQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-reports-failures'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowApiExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If
+        - UseRuntimeRoleHardening
+        - !Sub '${AWS::StackName}-api-runtime'
+        - !Ref AWS::NoValue
+      PermissionsBoundary: !If
+        - UseRuntimeRoleHardening
+        - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${AWS::StackName}-api-runtime-boundary'
+        - !Ref AWS::NoValue
+      Description: Funcao de execucao exclusiva da Lambda API do FeedFlow.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: FeedFlowApiDynamoDbAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteAndReadFeedbackById
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt FeedFlowFeedbackTable.Arn
+              - Sid: QueryFeedbackByWeek
+                Effect: Allow
+                Action:
+                  - dynamodb:Query
+                Resource: !Sub '${FeedFlowFeedbackTable.Arn}/index/byWeek'
+        - PolicyName: FeedFlowApiCloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-api:log-stream:*'
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowNotificationsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If
+        - UseRuntimeRoleHardening
+        - !Sub '${AWS::StackName}-notifications-runtime'
+        - !Ref AWS::NoValue
+      PermissionsBoundary: !If
+        - UseRuntimeRoleHardening
+        - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${AWS::StackName}-notifications-runtime-boundary'
+        - !Ref AWS::NoValue
+      Description: Funcao de execucao exclusiva da Lambda de notificacoes do FeedFlow.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: FeedFlowNotificationsStreamRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadFeedbackStream
+                Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                Resource: !GetAtt FeedFlowFeedbackTable.StreamArn
+              - Sid: ListFeedbackStreams
+                Effect: Allow
+                Action:
+                  - dynamodb:ListStreams
+                Resource: '*'
+        - PolicyName: FeedFlowNotificationsPublishAlert
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PublishCriticalAlert
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref FeedFlowCriticalAlertsTopic
+        - PolicyName: FeedFlowNotificationsFailureDestination
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SendDiscardedBatchMetadata
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt FeedFlowNotificationsFailureQueue.Arn
+        - PolicyName: FeedFlowNotificationsCloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-notifications:log-stream:*'
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowReportsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If
+        - UseRuntimeRoleHardening
+        - !Sub '${AWS::StackName}-reports-runtime'
+        - !Ref AWS::NoValue
+      PermissionsBoundary: !If
+        - UseRuntimeRoleHardening
+        - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${AWS::StackName}-reports-runtime-boundary'
+        - !Ref AWS::NoValue
+      Description: Funcao de execucao exclusiva da Lambda de relatorios do FeedFlow.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: FeedFlowReportsQueryByWeek
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: QueryFeedbackByWeek
+                Effect: Allow
+                Action:
+                  - dynamodb:Query
+                Resource: !Sub '${FeedFlowFeedbackTable.Arn}/index/byWeek'
+        - PolicyName: FeedFlowReportsPublishReport
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PublishWeeklyReport
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref FeedFlowWeeklyReportsTopic
+        - PolicyName: FeedFlowReportsFailureDestination
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SendFailedInvocationRecord
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt FeedFlowReportsFailureQueue.Arn
+        - PolicyName: FeedFlowReportsCloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-reports:log-stream:*'
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowReportsSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If
+        - UseRuntimeRoleHardening
+        - !Sub '${AWS::StackName}-reports-scheduler'
+        - !Ref AWS::NoValue
+      PermissionsBoundary: !If
+        - UseRuntimeRoleHardening
+        - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${AWS::StackName}-reports-scheduler-boundary'
+        - !Ref AWS::NoValue
+      Description: Permite ao EventBridge Scheduler invocar somente a Lambda de relatorios.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - scheduler.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: FeedFlowReportsSchedulerInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeWeeklyReportsFunction
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt FeedFlowReportsFunction.Arn
+              - Sid: SendSchedulerFailureToQueue
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt FeedFlowReportsFailureQueue.Arn
+      Tags:
+        - Key: Application
+          Value: FeedFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FeedFlowApiFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - FeedFlowApiLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-api'
+      Description: API HTTP do FeedFlow.
+      CodeUri: feedflow-api/target/function.zip
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Runtime: java17
+      Architectures:
+        - x86_64
+      MemorySize: 512
+      Timeout: 15
+      Role: !GetAtt FeedFlowApiExecutionRole.Arn
+      Environment:
+        Variables:
+          FEEDFLOW_DYNAMODB_TABLE_NAME: !Ref FeedFlowFeedbackTable
+          FEEDFLOW_DYNAMODB_QUERY_PAGE_SIZE: '100'
+      Events:
+        HealthRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FeedFlowHttpApi
+            Path: /health
+            Method: GET
+            PayloadFormatVersion: '2.0'
+        AvaliacaoRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FeedFlowHttpApi
+            Path: /avaliacao
+            Method: POST
+            PayloadFormatVersion: '2.0'
+      Tags:
+        Application: FeedFlow
+        Environment: !Ref EnvironmentName
+
+  FeedFlowNotificationsFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - FeedFlowNotificationsLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-notifications'
+      Description: Publica alertas SNS para novas avaliacoes criticas.
+      CodeUri: feedflow-notifications/target/function.zip
+      Handler: br.com.feedflow.notifications.handler.CriticalNotificationHandler::handleRequest
+      Runtime: java17
+      Architectures:
+        - x86_64
+      MemorySize: 256
+      Timeout: 20
+      Role: !GetAtt FeedFlowNotificationsExecutionRole.Arn
+      PropagateTags: true
+      Environment:
+        Variables:
+          FEEDFLOW_ALERT_TOPIC_ARN: !Ref FeedFlowCriticalAlertsTopic
+      Events:
+        FeedbackStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt FeedFlowFeedbackTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 1
+            Enabled: true
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            BisectBatchOnFunctionError: true
+            MaximumRetryAttempts: 3
+            MaximumRecordAgeInSeconds: 3600
+            DestinationConfig:
+              OnFailure:
+                Type: SQS
+                Destination: !GetAtt FeedFlowNotificationsFailureQueue.Arn
+      Tags:
+        Application: FeedFlow
+        Environment: !Ref EnvironmentName
+
+  FeedFlowReportsFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - FeedFlowReportsLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-reports'
+      Description: Gera e publica o relatorio das avaliacoes da semana anterior.
+      CodeUri: feedflow-reports/target/function.zip
+      Handler: br.com.feedflow.reports.handler.WeeklyReportHandler::handleRequest
+      Runtime: java17
+      Architectures:
+        - x86_64
+      MemorySize: 512
+      Timeout: 60
+      Role: !GetAtt FeedFlowReportsExecutionRole.Arn
+      Environment:
+        Variables:
+          FEEDFLOW_DYNAMODB_TABLE_NAME: !Ref FeedFlowFeedbackTable
+          FEEDFLOW_REPORT_TOPIC_ARN: !Ref FeedFlowWeeklyReportsTopic
+      Tags:
+        Application: FeedFlow
+        Environment: !Ref EnvironmentName
+
+  FeedFlowReportsEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref FeedFlowReportsFunction
+      Qualifier: '$LATEST'
+      MaximumEventAgeInSeconds: 3600
+      MaximumRetryAttempts: 2
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt FeedFlowReportsFailureQueue.Arn
+
+  FeedFlowWeeklyReportSchedule:
+    Type: AWS::Scheduler::Schedule
+    DependsOn:
+      - FeedFlowReportsEventInvokeConfig
+    Properties:
+      Name: !Sub '${AWS::StackName}-weekly-report'
+      Description: Executa o relatorio FeedFlow toda segunda-feira as 09:00.
+      ScheduleExpression: 'cron(0 9 ? * MON *)'
+      ScheduleExpressionTimezone: America/Sao_Paulo
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: ENABLED
+      Target:
+        Arn: !GetAtt FeedFlowReportsFunction.Arn
+        RoleArn: !GetAtt FeedFlowReportsSchedulerRole.Arn
+        Input: '{"source":"feedflow.scheduler.weekly-report"}'
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 3600
+          MaximumRetryAttempts: 2
+        DeadLetterConfig:
+          Arn: !GetAtt FeedFlowReportsFailureQueue.Arn
+
+  # ---- Monitoramento (CloudWatch) ----
+
+  FeedFlowApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-api-lambda-errors'
+      AlarmDescription: Erros na Lambda da API.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FeedFlowApiFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FeedFlowOpsAlarmsTopic
+
+  FeedFlowApiDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-api-lambda-duration'
+      AlarmDescription: Duracao p95 da API proxima do timeout de 15s.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FeedFlowApiFunction
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 12000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FeedFlowOpsAlarmsTopic
+
+  FeedFlowNotificationsErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-notifications-lambda-errors'
+      AlarmDescription: Erros na Lambda de alertas criticos.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FeedFlowNotificationsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FeedFlowOpsAlarmsTopic
+
+  FeedFlowReportsErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-reports-lambda-errors'
+      AlarmDescription: Erros na Lambda do relatorio semanal.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FeedFlowReportsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FeedFlowOpsAlarmsTopic
+
+  FeedFlowHttpApi5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-http-api-5xx'
+      AlarmDescription: Respostas 5xx no API Gateway.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref FeedFlowHttpApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FeedFlowOpsAlarmsTopic
+
+  FeedFlowNotificationsDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-notifications-dlq-not-empty'
+      AlarmDescription: Alerta critico esgotou retries e foi para a fila de falhas.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FeedFlowNotificationsFailureQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FeedFlowOpsAlarmsTopic
+
+  FeedFlowReportsDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-reports-dlq-not-empty'
+      AlarmDescription: Relatorio semanal falhou e foi para a fila de falhas.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FeedFlowReportsFailureQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FeedFlowOpsAlarmsTopic
+
+  FeedFlowDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-overview'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Invocacoes por Lambda","region":"${AWS::Region}","stat":"Sum","period":300,
+              "metrics":[["AWS/Lambda","Invocations","FunctionName","${FeedFlowApiFunction}"],["...","${FeedFlowNotificationsFunction}"],["...","${FeedFlowReportsFunction}"]]}},
+            {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Erros por Lambda","region":"${AWS::Region}","stat":"Sum","period":300,
+              "metrics":[["AWS/Lambda","Errors","FunctionName","${FeedFlowApiFunction}"],["...","${FeedFlowNotificationsFunction}"],["...","${FeedFlowReportsFunction}"]]}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Duracao p95 (ms)","region":"${AWS::Region}","stat":"p95","period":300,
+              "metrics":[["AWS/Lambda","Duration","FunctionName","${FeedFlowApiFunction}"],["...","${FeedFlowNotificationsFunction}"],["...","${FeedFlowReportsFunction}"]]}},
+            {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"API Gateway: requisicoes, 4xx e 5xx","region":"${AWS::Region}","stat":"Sum","period":300,
+              "metrics":[["AWS/ApiGateway","Count","ApiId","${FeedFlowHttpApi}"],[".","4xx",".","."],[".","5xx",".","."]]}},
+            {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{"title":"Filas de falhas (mensagens visiveis)","region":"${AWS::Region}","stat":"Maximum","period":300,
+              "metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${FeedFlowNotificationsFailureQueue.QueueName}"],["...","${FeedFlowReportsFailureQueue.QueueName}"]]}},
+            {"type":"log","x":12,"y":12,"width":12,"height":6,"properties":{"title":"Ultimos erros (API)","region":"${AWS::Region}","view":"table",
+              "query":"SOURCE '${FeedFlowApiLogGroup}' | fields @timestamp, @message | filter @message like /ERROR/ | sort @timestamp desc | limit 20"}}
+          ]
+        }
+
+Outputs:
+  ApiUrl:
+    Description: URL base da HTTP API no stage padrao.
+    Value: !Sub 'https://${FeedFlowHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+
+  HealthUrl:
+    Description: URL do endpoint de saude.
+    Value: !Sub 'https://${FeedFlowHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/health'
+
+  AvaliacaoAsciiUrl:
+    Description: URL oficial da avaliacao.
+    Value: !Sub 'https://${FeedFlowHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/avaliacao'
+
+  ApiFunctionName:
+    Description: Nome da Lambda API.
+    Value: !Ref FeedFlowApiFunction
+
+  ApiExecutionRoleArn:
+    Description: ARN da funcao IAM exclusiva da Lambda API.
+    Value: !GetAtt FeedFlowApiExecutionRole.Arn
+
+  FeedbackTable:
+    Description: Nome da tabela DynamoDB.
+    Value: !Ref FeedFlowFeedbackTable
+
+  FeedbackTableStreamArn:
+    Description: ARN do DynamoDB Stream consumido pela Lambda de notificacoes.
+    Value: !GetAtt FeedFlowFeedbackTable.StreamArn
+
+  ApiLogGroup:
+    Description: Log group da Lambda API.
+    Value: !Ref FeedFlowApiLogGroup
+
+  NotificationsFunctionName:
+    Description: Nome da Lambda de notificacoes criticas.
+    Value: !Ref FeedFlowNotificationsFunction
+
+  NotificationsExecutionRoleArn:
+    Description: ARN da funcao IAM exclusiva da Lambda de notificacoes.
+    Value: !GetAtt FeedFlowNotificationsExecutionRole.Arn
+
+  CriticalAlertsTopicArn:
+    Description: ARN do topico SNS de alertas criticos, sem assinatura criada automaticamente.
+    Value: !Ref FeedFlowCriticalAlertsTopic
+
+  NotificationsFailureQueueUrl:
+    Description: URL da fila que recebe metadados de lotes descartados apos os retries.
+    Value: !Ref FeedFlowNotificationsFailureQueue
+
+  NotificationsLogGroup:
+    Description: Log group da Lambda de notificacoes.
+    Value: !Ref FeedFlowNotificationsLogGroup
+
+  ReportsFunctionName:
+    Description: Nome da Lambda de relatorios semanais.
+    Value: !Ref FeedFlowReportsFunction
+
+  ReportsExecutionRoleArn:
+    Description: ARN da funcao IAM exclusiva da Lambda de relatorios.
+    Value: !GetAtt FeedFlowReportsExecutionRole.Arn
+
+  WeeklyReportsTopicArn:
+    Description: ARN do topico SNS de relatorios, sem assinatura criada automaticamente.
+    Value: !Ref FeedFlowWeeklyReportsTopic
+
+  WeeklyReportScheduleArn:
+    Description: ARN do agendamento semanal do EventBridge Scheduler.
+    Value: !GetAtt FeedFlowWeeklyReportSchedule.Arn
+
+  ReportsFailureQueueUrl:
+    Description: Fila com falhas de entrega do Scheduler e execucoes Lambda descartadas.
+    Value: !Ref FeedFlowReportsFailureQueue
+
+  ReportsLogGroup:
+    Description: Log group da Lambda de relatorios.
+    Value: !Ref FeedFlowReportsLogGroup
+
+  OpsAlarmsTopicArn:
+    Description: Topico SNS que recebe os alarmes operacionais.
+    Value: !Ref FeedFlowOpsAlarmsTopic
+
+  DashboardName:
+    Description: Dashboard CloudWatch com a visao geral da aplicacao.
+    Value: !Ref FeedFlowDashboard
